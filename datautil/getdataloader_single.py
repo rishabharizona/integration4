@@ -322,18 +322,26 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
     # Group validation indices by domain
     domain_indices = {}
     unique_domains = set()
+    
+    # Check if we're dealing with PyG Data objects
+    is_pyg_data = hasattr(train_dataset, 'data') and isinstance(train_dataset.data, list) and isinstance(train_dataset.data[0], Data)
+    
     for idx in range(len(val_dataset)):
-        # Get domain ID from dataset (index 2 is domain label)
-        domain = val_dataset[idx][2].item() if isinstance(val_dataset[idx][2], torch.Tensor) else val_dataset[idx][2]
+        # Get domain ID - different handling for PyG vs standard
+        if is_pyg_data:
+            # For PyG datasets, domains are stored in the Data object
+            domain = val_dataset[idx].domain.item()
+        else:
+            # For standard datasets (domain is index 2)
+            item = val_dataset[idx]
+            domain = item[2].item() if isinstance(item[2], torch.Tensor) else item[2]
+        
         unique_domains.add(domain)
         domain_indices.setdefault(domain, []).append(idx)
     
-    # Log actual number of domains found
     print(f"\nFound {len(unique_domains)} unique domains in validation set")
     
     domain_metrics = []
-
-    # Use min workers for validation to avoid overloading
     num_workers_val = min(4, args.N_WORKERS)
     
     # Compute loss and accuracy for each domain
@@ -341,12 +349,13 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
         for domain, indices in domain_indices.items():
             subset = Subset(val_dataset, indices)
             
-            # Handle GNN vs standard model inputs
-            if hasattr(args, 'model_type') and args.model_type == 'gnn':
-                loader = get_gnn_dataloader(subset, args.batch_size, num_workers_val, shuffle=False)
+            # Create appropriate loader
+            if loader_class == PyGDataLoader:
+                loader = PyGDataLoader(subset, batch_size=args.batch_size, 
+                                      shuffle=False, num_workers=num_workers_val)
             else:
-                loader = DataLoader(subset, batch_size=args.batch_size, 
-                                   shuffle=False, num_workers=num_workers_val)
+                loader = TorchDataLoader(subset, batch_size=args.batch_size, 
+                                        shuffle=False, num_workers=num_workers_val)
 
             total_loss = 0.0
             correct = 0
@@ -354,12 +363,17 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
             num_batches = 0
 
             for batch in loader:
-                # Handle GNN vs standard model inputs
-                if hasattr(args, 'model_type') and args.model_type == 'gnn':
-                    batched_graph, labels, domains = batch
-                    inputs = batched_graph.to(args.device)
-                    labels = labels.to(args.device)
+                # Handle PyG Data objects differently
+                if isinstance(batch, Data) or (isinstance(batch, list) and isinstance(batch[0], Data)):
+                    # For PyG, batch is either a single Data or list of Data
+                    if isinstance(batch, list):
+                        # Batch is list of Data objects - convert to Batch
+                        batch = Batch.from_data_list(batch)
+                    
+                    inputs = batch.to(args.device)
+                    labels = batch.y.to(args.device)
                 else:
+                    # Standard data format
                     inputs = batch[0].to(args.device).float()
                     labels = batch[1].to(args.device).long()
                 
@@ -376,7 +390,7 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
             accuracy = correct / total if total > 0 else 0
             domain_metrics.append((domain, avg_loss, accuracy))
 
-    # Calculate domain difficulty scores with numerical stability
+    # Calculate domain difficulty scores
     losses = [m[1] for m in domain_metrics]
     min_loss, max_loss = min(losses), max(losses)
     accs = [m[2] for m in domain_metrics]
@@ -384,52 +398,36 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
     
     domain_scores = []
     for domain, loss, acc in domain_metrics:
-        # Safe normalization with epsilon protection
-        loss_range = max_loss - min_loss
-        acc_range = max_acc - min_acc
+        # Safe normalization
+        loss_range = max(max_loss - min_loss, 1e-8)
+        acc_range = max(max_acc - min_acc, 1e-8)
         
-        norm_loss = 0.0
-        if loss_range > 1e-8:  # Only normalize if significant range exists
-            norm_loss = (loss - min_loss) / loss_range
+        norm_loss = (loss - min_loss) / loss_range
+        norm_acc = (acc - min_acc) / acc_range
         
-        norm_acc = 0.0
-        if acc_range > 1e-8:
-            norm_acc = (acc - min_acc) / acc_range
-        
-        # Clamp values to [0,1] range
+        # Clamp values
         norm_loss = max(0.0, min(1.0, norm_loss))
         norm_acc = max(0.0, min(1.0, norm_acc))
         
-        # Difficulty score: higher = harder
+        # Difficulty score (higher = harder)
         difficulty = 0.7 * norm_loss + 0.3 * (1 - norm_acc)
         domain_scores.append((domain, difficulty))
 
     # Sort by easiest domains first
     domain_scores.sort(key=lambda x: x[1])
     
-    # Only print top and bottom domains for readability
+    # Print domain difficulty ranking
     print("\n--- Domain Difficulty Ranking (easiest to hardest) ---")
-    print(f"Showing top 10 and bottom 10 of {len(domain_scores)} domains")
-    
-    # Print easiest domains
-    for rank, (domain, difficulty) in enumerate(domain_scores[:10], 1):
+    for rank, (domain, difficulty) in enumerate(domain_scores, 1):
         print(f"{rank}. Domain {domain}: Difficulty = {difficulty:.4f}")
-    
-    # Print separator if there are many domains
-    if len(domain_scores) > 20:
-        print("...")
-        # Print hardest domains
-        for rank in range(len(domain_scores)-10, len(domain_scores)):
-            domain, difficulty = domain_scores[rank]
-            print(f"{rank+1}. Domain {domain}: Difficulty = {difficulty:.4f}")
 
-    # Curriculum progression - FIXED HERE
+    # Curriculum progression
     num_domains = len(domain_scores)
-    total_stages = len(args.CL_PHASE_EPOCHS)  # Get the number of stages
-    progress = min(1.0, (stage + 1) / total_stages)  # Calculate progress correctly
+    total_stages = len(args.CL_PHASE_EPOCHS)
+    progress = min(1.0, (stage + 1) / total_stages)
     progress = np.sqrt(progress)  # Slower initial progression
     
-    num_selected = max(2, min(num_domains, int(np.ceil(progress * num_domains * 0.8))))
+    num_selected = max(2, min(num_domains, int(np.ceil(progress * num_domains * 0.8)))
     selected_domains = [domain for domain, _ in domain_scores[:num_selected]]
     
     # Add random harder domain for diversity
@@ -441,9 +439,15 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
     # Gather training indices from selected domains
     train_domain_indices = {}
     max_domain_size = 0
+    
     for idx in range(len(train_dataset)):
-        # Get domain ID from dataset (index 2 is domain label)
-        domain = train_dataset[idx][2].item() if isinstance(train_dataset[idx][2], torch.Tensor) else train_dataset[idx][2]
+        # Get domain ID - different handling for PyG vs standard
+        if is_pyg_data:
+            domain = train_dataset[idx].domain.item()
+        else:
+            item = train_dataset[idx]
+            domain = item[2].item() if isinstance(item[2], torch.Tensor) else item[2]
+        
         train_domain_indices.setdefault(domain, []).append(idx)
         if len(train_domain_indices[domain]) > max_domain_size:
             max_domain_size = len(train_domain_indices[domain])
@@ -452,7 +456,7 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
     for domain in selected_domains:
         if domain in train_domain_indices:
             domain_indices = train_domain_indices[domain]
-            # Proportional sampling based on domain size
+            # Proportional sampling
             sample_ratio = 0.5 + 0.5 * (1 - len(domain_indices) / max_domain_size)
             n_samples = min(len(domain_indices), max(50, int(len(domain_indices) * sample_ratio)))
             selected_indices.extend(random.sample(domain_indices, n_samples))
@@ -467,33 +471,23 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
     print(f"Selected {len(selected_indices)} samples from {len(selected_domains)} domains")
     
     # Create curriculum subset
-    curriculum_subset = SafeSubset(train_dataset, selected_indices)
+    curriculum_subset = Subset(train_dataset, selected_indices)
     
-    # Use min workers to avoid overloading
+    # Create appropriate loader
     num_workers_train = min(4, args.N_WORKERS)
     
-    # Handle loader creation based on provided loader class
-    if loader_class is None:
-        # Backward compatibility
-        if hasattr(args, 'model_type') and args.model_type == 'gnn':
-            return get_gnn_dataloader(
-                curriculum_subset,
-                args.batch_size,
-                num_workers_train,
-                shuffle=True
-            )
-        else:
-            return DataLoader(
-                curriculum_subset,
-                batch_size=args.batch_size,
-                shuffle=True,
-                num_workers=num_workers_train,
-                drop_last=True
-            )
-    else:
-        # Use provided loader class (PyG or standard)
+    if loader_class:
         return loader_class(
             dataset=curriculum_subset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=num_workers_train,
+            drop_last=True
+        )
+    else:
+        # Default to TorchDataLoader if no loader_class specified
+        return TorchDataLoader(
+            curriculum_subset,
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=num_workers_train,
