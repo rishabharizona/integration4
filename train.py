@@ -816,10 +816,10 @@ def main(args):
                             'total_cost_time', 'h_divergence', 'domain_acc']}
     best_valid_acc, target_acc = 0, 0
     # Determine loader class for entire source loader
-if args.use_gnn and GNN_AVAILABLE:
-    LoaderClass = PyGDataLoader
-else:
-    LoaderClass = TorchDataLoader
+    if args.use_gnn and GNN_AVAILABLE:
+        LoaderClass = PyGDataLoader
+    else:
+        LoaderClass = TorchDataLoader
     # Create entire source loader for h-divergence calculation
     entire_source_loader = LoaderClass(
         tr,
