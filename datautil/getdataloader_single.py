@@ -363,6 +363,9 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage):
     
     # Compute loss and accuracy for each domain
     with torch.no_grad():
+        # Get device from algorithm's parameters
+        device = next(algorithm.parameters()).device
+        
         for domain, indices in domain_indices.items():
             subset = Subset(val_dataset, indices)
             
@@ -390,11 +393,11 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage):
             for batch in loader:
                 # Handle graph data differently
                 if is_graph_data:
-                    inputs = batch[0].to(args.device)
-                    labels = batch[1].to(args.device)
+                    inputs = batch[0].to(device)
+                    labels = batch[1].to(device)
                 else:
-                    inputs = batch[0].to(args.device).float()
-                    labels = batch[1].to(args.device).long()
+                    inputs = batch[0].to(device).float()
+                    labels = batch[1].to(device).long()
                 
                 output = algorithm.predict(inputs)
                 loss = torch.nn.functional.cross_entropy(output, labels)
