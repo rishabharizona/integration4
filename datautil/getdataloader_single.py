@@ -306,7 +306,7 @@ def get_act_dataloader(args):
     loaders = get_dataloader(args, tr, val, targetdata)
     return (*loaders, tr, val, targetdata)
 
-def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, loader_class=None):
+def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage):
     """
     Create a curriculum data loader based on domain difficulty
     Args:
@@ -315,25 +315,42 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
         train_dataset: Full training dataset
         val_dataset: Validation dataset
         stage: Current training stage/phase
-        loader_class: DataLoader class to use (PyGDataLoader or TorchDataLoader)
     Returns:
         Curriculum DataLoader with selected samples
     """
+    # Determine if we're using graph data
+    is_graph_data = False
+    if len(val_dataset) > 0:
+        sample = val_dataset[0]
+        # Check for different graph data formats
+        if (isinstance(sample, tuple) and len(sample) >= 3 and 
+            isinstance(sample[0], Data)):
+            is_graph_data = True
+        # Direct Data object
+        elif isinstance(sample, Data):
+            is_graph_data = True
+        # Dictionary format
+        elif isinstance(sample, dict) and 'graph' in sample:
+            is_graph_data = True
+    
     # Group validation indices by domain
     domain_indices = {}
     unique_domains = set()
     
-    # Check if we're dealing with PyG Data objects
-    is_pyg_data = hasattr(train_dataset, 'data') and isinstance(train_dataset.data, list) and isinstance(train_dataset.data[0], Data)
-    
     for idx in range(len(val_dataset)):
-        # Get domain ID - different handling for PyG vs standard
-        if is_pyg_data:
-            # For PyG datasets, domains are stored in the Data object
-            domain = val_dataset[idx].domain.item()
+        # Get domain ID - different handling for graph vs standard data
+        item = val_dataset[idx]
+        
+        if is_graph_data:
+            # For graph data, domain is index 2 in tuple or Data attribute
+            if isinstance(item, Data):
+                domain = item.domain.item()
+            elif isinstance(item, tuple):
+                domain = item[2].item() if isinstance(item[2], torch.Tensor) else item[2]
+            else:  # Dictionary format
+                domain = item.get('domain', 0)
         else:
             # For standard datasets (domain is index 2)
-            item = val_dataset[idx]
             domain = item[2].item() if isinstance(item[2], torch.Tensor) else item[2]
         
         unique_domains.add(domain)
@@ -349,13 +366,21 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
         for domain, indices in domain_indices.items():
             subset = Subset(val_dataset, indices)
             
-            # Create appropriate loader
-            if loader_class == PyGDataLoader:
-                loader = PyGDataLoader(subset, batch_size=args.batch_size, 
-                                      shuffle=False, num_workers=num_workers_val)
+            # Create appropriate loader based on data type
+            if is_graph_data:
+                loader = get_gnn_dataloader(
+                    subset, 
+                    args.batch_size, 
+                    num_workers_val, 
+                    shuffle=False
+                )
             else:
-                loader = TorchDataLoader(subset, batch_size=args.batch_size, 
-                                        shuffle=False, num_workers=num_workers_val)
+                loader = DataLoader(
+                    subset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=num_workers_val
+                )
 
             total_loss = 0.0
             correct = 0
@@ -363,17 +388,11 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
             num_batches = 0
 
             for batch in loader:
-                # Handle PyG Data objects differently
-                if isinstance(batch, Data) or (isinstance(batch, list) and isinstance(batch[0], Data)):
-                    # For PyG, batch is either a single Data or list of Data
-                    if isinstance(batch, list):
-                        # Batch is list of Data objects - convert to Batch
-                        batch = Batch.from_data_list(batch)
-                    
-                    inputs = batch.to(args.device)
-                    labels = batch.y.to(args.device)
+                # Handle graph data differently
+                if is_graph_data:
+                    inputs = batch[0].to(args.device)
+                    labels = batch[1].to(args.device)
                 else:
-                    # Standard data format
                     inputs = batch[0].to(args.device).float()
                     labels = batch[1].to(args.device).long()
                 
@@ -427,7 +446,7 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
     progress = min(1.0, (stage + 1) / total_stages)
     progress = np.sqrt(progress)  # Slower initial progression
     
-    num_selected = max(2, min(num_domains, int(np.ceil(progress * num_domains * 0.8))))
+    num_selected = max(2, min(num_domains, int(np.ceil(progress * num_domains * 0.8)))
     selected_domains = [domain for domain, _ in domain_scores[:num_selected]]
     
     # Add random harder domain for diversity
@@ -441,11 +460,17 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
     max_domain_size = 0
     
     for idx in range(len(train_dataset)):
-        # Get domain ID - different handling for PyG vs standard
-        if is_pyg_data:
-            domain = train_dataset[idx].domain.item()
+        # Get domain ID
+        item = train_dataset[idx]
+        
+        if is_graph_data:
+            if isinstance(item, Data):
+                domain = item.domain.item()
+            elif isinstance(item, tuple):
+                domain = item[2].item() if isinstance(item[2], torch.Tensor) else item[2]
+            else:  # Dictionary format
+                domain = item.get('domain', 0)
         else:
-            item = train_dataset[idx]
             domain = item[2].item() if isinstance(item[2], torch.Tensor) else item[2]
         
         train_domain_indices.setdefault(domain, []).append(idx)
@@ -456,7 +481,7 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
     for domain in selected_domains:
         if domain in train_domain_indices:
             domain_indices = train_domain_indices[domain]
-            # Proportional sampling
+            # Proportional sampling - smaller domains get higher representation
             sample_ratio = 0.5 + 0.5 * (1 - len(domain_indices) / max_domain_size)
             n_samples = min(len(domain_indices), max(50, int(len(domain_indices) * sample_ratio)))
             selected_indices.extend(random.sample(domain_indices, n_samples))
@@ -476,17 +501,15 @@ def get_curriculum_loader(args, algorithm, train_dataset, val_dataset, stage, lo
     # Create appropriate loader
     num_workers_train = min(4, args.N_WORKERS)
     
-    if loader_class:
-        return loader_class(
-            dataset=curriculum_subset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=num_workers_train,
-            drop_last=True
+    if is_graph_data:
+        return get_gnn_dataloader(
+            curriculum_subset,
+            args.batch_size,
+            num_workers_train,
+            shuffle=True
         )
     else:
-        # Default to TorchDataLoader if no loader_class specified
-        return TorchDataLoader(
+        return DataLoader(
             curriculum_subset,
             batch_size=args.batch_size,
             shuffle=True,
