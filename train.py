@@ -896,7 +896,9 @@ def main(args):
                     return curriculum_predict(x)
             
             evaluator = CurriculumEvaluator()
-            
+
+            # Use PyGDataLoader for curriculum when GNN is enabled
+            LoaderClass = PyGDataLoader if args.use_gnn and GNN_AVAILABLE else TorchDataLoader
             # Get the curriculum loader
             train_loader = get_curriculum_loader(
                 args,
@@ -904,7 +906,7 @@ def main(args):
                 tr,
                 val,
                 stage=round_idx,
-                loader_class=PyGDataLoader  # Pass PyG loader class
+                loader_class=LoaderClass  # Pass PyG loader class
             )
                # Determine loader class for entire source loader
             if args.use_gnn and GNN_AVAILABLE:
@@ -926,7 +928,7 @@ def main(args):
                 tr,
                 val,
                 stage=round_idx,
-                loader_class=TorchDataLoader  # Pass standard loader class
+                loader_class=LoaderClass  # Pass standard loader class
             )
             train_loader_noshuffle = TorchDataLoader(
                 train_loader.dataset,
